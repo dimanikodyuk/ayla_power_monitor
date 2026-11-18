@@ -1,0 +1,15 @@
+[Unit]
+Description=Ayla Power Monitor (monitor and Telegram bot)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/ayla_power_monitor
+ExecStart=/home/pi/ayla_power_monitor/.venv/bin/python /home/pi/ayla_power_monitor/main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

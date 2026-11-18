@@ -1,4 +1,5 @@
 import logging
+import platform
 import time
 from pathlib import Path
 from .database import connect, init, utc_now
@@ -7,9 +8,15 @@ from .config import INTERVAL
 LOG=logging.getLogger(__name__)
 
 def boot_id():
+    if platform.system() == "Windows":
+        # Windows monotonic clock approximates uptime; group by boot epoch.
+        # This is a test-mode identifier, not a forensic boot ID.
+        return f"windows-{platform.node()}-{round((time.time()-time.monotonic())/120)}"
     return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
 
 def synced():
+    if platform.system() == "Windows":
+        return True  # Windows test mode uses system clock; verify its sync manually.
     # timedatectl reports whether system time has been synchronized.
     import subprocess
     try:

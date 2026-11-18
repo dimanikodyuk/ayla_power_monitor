@@ -83,3 +83,30 @@ SQLite використовує WAL і `synchronous=FULL`; **це не гара�
 ## Оновлення
 
 Не видаляйте `.env` та `data/`. Зупиніть сервіси перед заміною файлів. Зберігайте лише один `README.md`.
+
+
+---
+# Ayla Power Monitor v1.0.1 — запуск
+
+## Windows / PyCharm
+
+Відкрийте проєкт у PyCharm, встановіть залежності `pip install -r requirements.txt`, скопіюйте `.env.example` у `.env` та заповніть Telegram-токен і ID. Запускайте **один файл `main.py`** зеленою кнопкою Run. Він одночасно запускає моніторинг і Telegram-бота.
+
+На Windows це **тестовий режим**: облік роботи ПК, а не електромережі Raspberry Pi. Системний час Windows повинен бути правильним.
+
+## Raspberry Pi
+
+Запускайте `python main.py` або встановіть єдиний сервіс `systemd/ayla-power.service`. Перед переходом із попередньої версії вимкніть обидва старі сервіси, інакше вони можуть одночасно записувати heartbeat і конфліктувати за Telegram polling:
+
+```bash
+sudo systemctl disable --now ayla-power-monitor.service ayla-power-bot.service
+sudo cp systemd/ayla-power.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ayla-power.service
+```
+
+Сервіс розрахований на користувача `pi` і шлях `/home/pi/ayla_power_monitor`; за потреби змініть їх у service-файлі.
+
+## Важливо
+
+Відсутність heartbeat **не доводить** відключення світла: це може бути зупинка ПК, збій агента або некоректний час. HTML widget-sandbox залишається експериментальним локальним preview, а не Telegram-віджетом. `.env` і `data/` не замінюйте при оновленні.
