@@ -1,0 +1,13 @@
+[Unit]
+Description=Ayla Power Monitor heartbeat
+Wants=time-sync.target
+After=time-sync.target
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/ayla_power_monitor
+ExecStart=/home/pi/ayla_power_monitor/.venv/bin/python -m app.monitor
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
