@@ -2,8 +2,9 @@ import asyncio
 import csv
 import io
 import logging
+import os
 from datetime import timedelta
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update, WebAppInfo
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from .config import BOT_TOKEN, ADMIN_IDS, CHAT_ID, TZ
 from .database import init, connect, utc_now, setting, set_setting
@@ -40,10 +41,13 @@ async def start(update,ctx):
     if not await guard(update): return
     keys=[[InlineKeyboardButton("📊 Сьогодні",callback_data="today"),InlineKeyboardButton("📅 Тиждень",callback_data="week")],
           [InlineKeyboardButton("❓ Допомога",callback_data="help"),InlineKeyboardButton("📜 Історія",callback_data="history")]]
+    public_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if public_url.startswith("https://"):
+        keys.insert(0,[InlineKeyboardButton("⚡ Відкрити дашборд",web_app=WebAppInfo(url=public_url+"/"))])
     await send(update,"⚡ Ayla Power Monitor\\nМоніторинг Raspberry Pi та статистика розривів.",reply_markup=InlineKeyboardMarkup(keys))
 
 async def help_cmd(update,ctx):
-    if await guard(update): await send(update,HELP.replace("\\n","\n"))
+    if await guard(update): await send(update,HELP)
 
 async def status(update,ctx):
     if not await guard(update): return

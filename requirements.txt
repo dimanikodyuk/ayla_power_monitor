@@ -1,2 +1,4 @@
 python-telegram-bot>=21,<23
 python-dotenv>=1,<2
+tzdata>=2025.2
+aiohttp>=3.10,<4
