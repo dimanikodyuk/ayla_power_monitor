@@ -1,174 +1,148 @@
+"""Telegram-first interface: image dashboards and inline buttons, no widget permission required."""
 import asyncio
 import csv
 import io
 import logging
-import os
-from datetime import timedelta
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update, WebAppInfo
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from datetime import datetime, timedelta
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto
+from telegram.error import BadRequest, TelegramError
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler
 from .config import BOT_TOKEN, ADMIN_IDS, CHAT_ID, TZ
 from .database import init, connect, utc_now, setting, set_setting
-from .statistics import daily, summary, format_duration, local_bounds, get_gaps
+from .statistics import daily, summary, format_duration, local_bounds
+from .dashboard import render
 
 LOG=logging.getLogger(__name__)
-COMMANDS=[
-("start","Головне меню"),("help","Список команд"),("status","Стан моніторингу"),
-("today","Статистика сьогодні"),("yesterday","Статистика вчора"),
-("week","Останні 7 днів"),("month","Поточний місяць"),
-("history","Історія розривів"),("heatmap","Теплова карта за тиждень"),
-("export","Експорт CSV"),("settings","Налаштування")
-]
-HELP="⚡ Ayla Power Monitor\\n\\n"+ "\\n".join(f"/{a} — {b}" for a,b in COMMANDS)+"\\n\\nℹ️ Розриви моніторингу не доводять відсутність електрики."
+SECTIONS={'today':'Сьогодні','week':'7 днів','month':'Місяць','history':'Історія'}
+COMMANDS=[('start','Відкрити дашборд'),('dashboard','Дашборд'),('help','Команди'),
+ ('status','Стан агента'),('today','Сьогодні'),('yesterday','Вчора'),
+ ('week','Останні 7 днів'),('month','Місяць'),('history','Розриви'),
+ ('heatmap','Теплова карта'),('export','Експорт CSV'),('settings','Налаштування')]
+
 
 def authorized(update):
-    user=update.effective_user
-    return bool(user and ADMIN_IDS and user.id in ADMIN_IDS)
-
-async def send(update, text, **kw):
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.message.reply_text(text,**kw)
-    else:
-        await update.effective_message.reply_text(text,**kw)
+    u=update.effective_user
+    return bool(u and u.id in ADMIN_IDS)
 
 async def guard(update):
-    if not authorized(update):
-        await send(update,"⛔ Немає доступу. Додайте ваш Telegram user ID до TELEGRAM_ADMIN_IDS.")
-        return False
-    return True
+    if authorized(update):return True
+    if update.callback_query:await update.callback_query.answer('⛔ Немає доступу',show_alert=True)
+    else:await update.effective_message.reply_text('⛔ Немає доступу. Перевір TELEGRAM_ADMIN_IDS у .env.')
+    return False
 
-async def start(update,ctx):
-    if not await guard(update): return
-    keys=[[InlineKeyboardButton("📊 Сьогодні",callback_data="today"),InlineKeyboardButton("📅 Тиждень",callback_data="week")],
-          [InlineKeyboardButton("❓ Допомога",callback_data="help"),InlineKeyboardButton("📜 Історія",callback_data="history")]]
-    public_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
-    if public_url.startswith("https://"):
-        keys.insert(0,[InlineKeyboardButton("⚡ Відкрити дашборд",web_app=WebAppInfo(url=public_url+"/"))])
-    await send(update,"⚡ Ayla Power Monitor\\nМоніторинг Raspberry Pi та статистика розривів.",reply_markup=InlineKeyboardMarkup(keys))
 
-async def help_cmd(update,ctx):
-    if await guard(update): await send(update,HELP)
+def buttons(section):
+    rows=[]
+    keys=list(SECTIONS)
+    for a,b in [('today','week'),('month','history')]:
+        rows.append([InlineKeyboardButton(('• ' if section==k else '')+SECTIONS[k],callback_data='dash:'+k) for k in (a,b)])
+    rows.append([InlineKeyboardButton('🔄 Оновити',callback_data='dash:'+section+':refresh'),
+                 InlineKeyboardButton('⚙️ Стан',callback_data='dash:status')])
+    return InlineKeyboardMarkup(rows)
 
-async def status(update,ctx):
-    if not await guard(update): return
-    with connect() as db:
-        r=db.execute("SELECT * FROM state WHERE id=1").fetchone()
-    if not r:
-        await send(update,"Моніторинг ще не записав heartbeat.");return
-    from datetime import datetime
-    last=datetime.fromisoformat(r["last_seen"])
-    age=(utc_now()-last).total_seconds()
-    await send(update,f"⚡ Агент: {'🟢 працює' if age<40 else '⚠️ немає свіжого сигналу'}\nОстанній heartbeat: {last.astimezone(TZ):%d.%m.%Y %H:%M:%S}\nВік сигналу: {max(0,int(age))} с")
 
-def stats_text(label,s):
-    total=s["total"]
-    pct=s["observed"]/total*100 if total else 0
-    return f"📊 {label}\n🟢 Моніторинг активний: {format_duration(s['observed'])} ({pct:.1f}%)\n⚪ Немає спостереження: {format_duration(s['unknown'])}\nℹ️ Це не прямий вимір наявності світла."
+def caption(section):
+    now=utc_now().astimezone(TZ)
+    return f'⚡ Ayla Power Monitor · {SECTIONS[section]}\n🕒 {now:%d.%m.%Y %H:%M} · Київ\nℹ️ Не вимірює електрику напряму'
 
-async def today(update,ctx):
-    if await guard(update):
-        await send(update,stats_text("Сьогодні",daily(utc_now().astimezone(TZ).date())))
-
-async def yesterday(update,ctx):
-    if await guard(update):
-        await send(update,stats_text("Вчора",daily(utc_now().astimezone(TZ).date()-timedelta(days=1))))
-
-async def week(update,ctx):
+async def dashboard(update,ctx,section='today'):
     if not await guard(update):return
-    day=utc_now().astimezone(TZ).date()
-    lines=["📅 Останні 7 днів"]
-    for offset in range(6,-1,-1):
-        d=day-timedelta(days=offset)
-        s=daily(d)
-        lines.append(f"{d:%d.%m}: 🟢 {format_duration(s['observed'])} · ⚪ {format_duration(s['unknown'])}")
-    await send(update,"\n".join(lines))
+    if section not in SECTIONS:section='today'
+    data=await asyncio.to_thread(render,section)
+    file=InputFile(io.BytesIO(data),filename='ayla_dashboard.png')
+    if update.callback_query:
+        q=update.callback_query
+        try:
+            await q.edit_message_media(media=InputMediaPhoto(media=file,caption=caption(section)),reply_markup=buttons(section))
+        except BadRequest as exc:
+            if 'message is not modified' not in str(exc).lower():
+                LOG.warning('Cannot edit dashboard; sending fresh one: %s',exc)
+                await q.message.reply_photo(photo=file,caption=caption(section),reply_markup=buttons(section))
+    else:
+        await update.effective_message.reply_photo(photo=file,caption=caption(section),reply_markup=buttons(section))
 
-async def month(update,ctx):
-    if not await guard(update):return
-    day=utc_now().astimezone(TZ).date()
-    start,_=local_bounds(day.replace(day=1))
-    await send(update,stats_text(f"Місяць {day:%m.%Y}",summary(start,utc_now())))
+async def start(u,c):await dashboard(u,c)
+async def today(u,c):await dashboard(u,c,'today')
+async def week(u,c):await dashboard(u,c,'week')
+async def month(u,c):await dashboard(u,c,'month')
+async def history(u,c):await dashboard(u,c,'history')
+async def heatmap(u,c):await dashboard(u,c,'month')
 
-async def history(update,ctx):
-    if not await guard(update):return
-    with connect() as db:
-        rows=db.execute("SELECT * FROM gaps ORDER BY id DESC LIMIT 12").fetchall()
-    if not rows: await send(update,"Розривів поки немає.");return
-    from datetime import datetime
-    lines=["📜 Останні розриви моніторингу"]
-    for r in rows:
-        t=datetime.fromisoformat(r["started_at"]).astimezone(TZ)
-        lines.append(f"{t:%d.%m %H:%M} · {format_duration(r['seconds'])} · {r['kind']}")
-    await send(update,"\n".join(lines))
+async def help_cmd(u,c):
+    if not await guard(u):return
+    await u.effective_message.reply_text('⚡ Ayla Power Monitor\n\n'+'\n'.join(f'/{k} — {v}' for k,v in COMMANDS)+'\n\n📊 /dashboard — інтерактивний дашборд')
 
-async def heatmap(update,ctx):
-    if not await guard(update):return
-    # Text heatmap avoids image dependency and works in any Telegram client.
-    day=utc_now().astimezone(TZ).date()
-    lines=["🗓 Heatmap (🟩 спостерігалось / ⬜ невідомо)","       00  04  08  12  16  20"]
-    for offset in range(6,-1,-1):
-        d=day-timedelta(days=offset)
-        start,_=local_bounds(d)
-        cells=[]
-        for h in range(0,24,4):
-            a=start+timedelta(hours=h)
-            b=a+timedelta(hours=4)
-            s=summary(a,b)
-            cells.append("🟩" if s["total"] and s["observed"]/s["total"]>=.9 else "⬜")
-        lines.append(f"{d:%d.%m} "+ "".join(cells))
-    await send(update,"\n".join(lines))
+async def status(u,c):
+    if not await guard(u):return
+    with connect() as db:r=db.execute('SELECT * FROM state WHERE id=1').fetchone()
+    if not r:message='⚪ Ще немає heartbeat від агента.'
+    else:
+        last=datetime.fromisoformat(r['last_seen'])
+        age=max(0,(utc_now()-last).total_seconds())
+        message=(f"{'🟢' if age<40 else '🟠'} Агент: {'активний' if age<40 else 'сигнал застарів'}\n"
+                 f'Останній heartbeat: {last.astimezone(TZ):%d.%m.%Y %H:%M:%S}\n'
+                 f'Час від останнього сигналу: {int(age)} с')
+    if u.callback_query:await u.callback_query.message.reply_text(message)
+    else:await u.effective_message.reply_text(message)
 
-async def export(update,ctx):
-    if not await guard(update):return
-    with connect() as db:
-        rows=db.execute("SELECT started_at,ended_at,seconds,kind,note FROM gaps ORDER BY started_at").fetchall()
-    f=io.StringIO()
-    writer=csv.writer(f)
-    writer.writerow(["started_at_utc","ended_at_utc","seconds","kind","note"])
-    for r in rows: writer.writerow(list(r))
-    bio=io.BytesIO(f.getvalue().encode("utf-8-sig"))
-    bio.name="ayla_power_gaps.csv"
-    await update.effective_message.reply_document(document=InputFile(bio,filename=bio.name))
+async def yesterday(u,c):
+    if not await guard(u):return
+    day=utc_now().astimezone(TZ).date()-timedelta(days=1);s=daily(day)
+    pct=100*s['observed']/s['total'] if s['total'] else 0
+    await u.effective_message.reply_text(f'📅 Вчора · {day:%d.%m.%Y}\n🟢 Спостереження: {format_duration(s["observed"])} ({pct:.1f}%)\n⚪ Невідомо: {format_duration(s["unknown"])}')
 
-async def settings(update,ctx):
-    if not await guard(update):return
-    await send(update,"⚙️ Налаштування v1.0\nЧасовий пояс: Europe/Kyiv\nІнтервал heartbeat: задається у .env\nСповіщення про розриви: "+("увімкнено" if setting("notify","1")=="1" else "вимкнено")+"\nКоманди: /notify_on /notify_off")
+async def export(u,c):
+    if not await guard(u):return
+    with connect() as db:rows=db.execute('SELECT started_at,ended_at,seconds,kind,note FROM gaps ORDER BY started_at').fetchall()
+    out=io.StringIO();w=csv.writer(out);w.writerow(['started_at_utc','ended_at_utc','seconds','kind','note'])
+    for row in rows:w.writerow(tuple(row))
+    buffer=io.BytesIO(out.getvalue().encode('utf-8-sig'))
+    await u.effective_message.reply_document(document=InputFile(buffer,filename='ayla_power_gaps.csv'))
 
-async def notify(update,ctx):
-    if not await guard(update):return
-    enabled=update.effective_message.text.strip().startswith("/notify_on")
-    set_setting("notify","1" if enabled else "0")
-    await send(update,"Сповіщення "+("увімкнено" if enabled else "вимкнено"))
+async def settings(u,c):
+    if not await guard(u):return
+    await u.effective_message.reply_text('⚙️ Ayla Power Monitor\nЧасовий пояс: Europe/Kyiv\nСповіщення: '+('увімкнено' if setting('notify','1')=='1' else 'вимкнено')+'\n/notify_on · /notify_off')
 
-async def callbacks(update,ctx):
-    command=update.callback_query.data
-    handlers={"today":today,"week":week,"help":help_cmd,"history":history}
-    if command in handlers: await handlers[command](update,ctx)
+async def notify(u,c):
+    if not await guard(u):return
+    enabled=u.effective_message.text.startswith('/notify_on')
+    set_setting('notify','1' if enabled else '0')
+    await u.effective_message.reply_text('Сповіщення '+('увімкнено' if enabled else 'вимкнено'))
+
+async def callbacks(u,c):
+    if not await guard(u):return
+    q=u.callback_query
+    await q.answer()
+    parts=(q.data or '').split(':')
+    if len(parts)<2 or parts[0]!='dash':return
+    if parts[1]=='status':return await status(u,c)
+    if parts[1] in SECTIONS:return await dashboard(u,c,parts[1])
 
 async def post_init(app):
-    await app.bot.set_my_commands([BotCommand(a,b) for a,b in COMMANDS])
-    # Send only previously recorded, not-yet-notified gaps; never invent outage claims.
-    if not CHAT_ID or setting("notify","1")!="1":return
-    with connect() as db:
-        rows=db.execute("SELECT id,started_at,seconds FROM gaps WHERE notified=0 ORDER BY id LIMIT 20").fetchall()
-    for r in rows:
+    await app.bot.set_my_commands([BotCommand(cmd,desc) for cmd,desc in COMMANDS])
+    # Send gaps recorded while monitor was offline. Notification must not claim proven power loss.
+    if not CHAT_ID or setting('notify','1')!='1':return
+    with connect() as db:rows=db.execute('SELECT id,seconds FROM gaps WHERE notified=0 ORDER BY id LIMIT 20').fetchall()
+    for row in rows:
         try:
-            await app.bot.send_message(chat_id=CHAT_ID,text=f"⚠️ Виявлено розрив моніторингу: {format_duration(r['seconds'])}. Причина невідома.")
-            with connect() as db: db.execute("UPDATE gaps SET notified=1 WHERE id=?",(r["id"],))
-        except Exception: LOG.exception("Notification delivery failed");break
+            await app.bot.send_message(CHAT_ID,f'⚠️ Зафіксовано розрив спостереження: {format_duration(row["seconds"])}. Причина невідома.')
+            with connect() as db:db.execute('UPDATE gaps SET notified=1 WHERE id=?',(row['id'],))
+        except TelegramError:LOG.exception('Cannot send gap alert');break
+
 
 def main():
-    if not BOT_TOKEN: raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env")
-    if not ADMIN_IDS: raise SystemExit("Set TELEGRAM_ADMIN_IDS in .env")
+    if not BOT_TOKEN:raise SystemExit('Вкажи TELEGRAM_BOT_TOKEN у .env')
+    if not ADMIN_IDS:raise SystemExit('Вкажи TELEGRAM_ADMIN_IDS у .env')
     init()
     logging.basicConfig(level=logging.INFO)
     app=Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    for name,fn in [("start",start),("help",help_cmd),("status",status),("today",today),
-                    ("yesterday",yesterday),("week",week),("month",month),
-                    ("history",history),("heatmap",heatmap),("export",export),
-                    ("settings",settings),("notify_on",notify),("notify_off",notify)]:
-        app.add_handler(CommandHandler(name,fn))
-    app.add_handler(CallbackQueryHandler(callbacks))
+    mapping=[('start',start),('dashboard',start),('help',help_cmd),('status',status),
+             ('today',today),('yesterday',yesterday),('week',week),('month',month),
+             ('history',history),('heatmap',heatmap),('export',export),('settings',settings),
+             ('notify_on',notify),('notify_off',notify)]
+    for name,callback in mapping:app.add_handler(CommandHandler(name,callback))
+    app.add_handler(CallbackQueryHandler(callbacks,pattern='^dash:'))
+    LOG.info('Telegram Dashboard ready (no sendWidget / web server)')
     app.run_polling(drop_pending_updates=True)
 
-if __name__=="__main__": main()
+if __name__=='__main__':main()
